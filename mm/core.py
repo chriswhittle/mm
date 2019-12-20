@@ -45,6 +45,9 @@ def defaultExt(array, default=0, min=False):
     else:
         return default
 
+def nearestIndex(array, value):
+    return np.argmin(np.abs(array-value))
+
 def emptyMatrix(d):
     '''
     Given a list of distances, return 2x2 identity matrices
@@ -52,41 +55,36 @@ def emptyMatrix(d):
     '''
     return np.tile(np.eye(2)[np.newaxis,:,:], (len(d), 1, 1) )
 
-def space(d, start, end):
+def space(d, start=None, end=None, startInd=None, endInd=None):
     '''
     Given a N-length list of distances and numbers specifying the
     start and end of propagation, return a Nx2x2 matrix for 
     propagation along the specified length.
     '''
-    startInd = np.argmax(d>=start)
-    endInd = np.argmax(d>=end)
+    if startInd is None:
+        startInd = nearestIndex(d, start)
+    elif start is None:
+        start = d[startInd]
+    
+    if endInd is None:
+        endInd = nearestIndex(d, end)
+    elif end is None:
+        end = d[endInd]
 
     matrix = emptyMatrix(d)
-    matrix[startInd:endInd,0,1] = np.linspace(0, end-start, endInd-startInd)
+    matrix[startInd:endInd,0,1] = d[startInd:endInd]-start
     matrix[endInd:,0,1] = end-start
 
     return matrix
 
-def buildTransfer(d, source, lenses):
-    '''
-    Given a N-length list of distances, the position from which
-    the transfer matrix should be built and a list of Lens objects,
-    return a Nx2x2 matrix for propagation through the lens system.
-    '''
-    d = np.array(d, ndmin=1)
-    for i in range(0, len(d)-1):
-        if d[i] > d[i+1]:
-            raise ValueError('List of positions should be sorted')
-            ################### TODO: add reverse logic
-    i = 0
+def curvedInterface(d, n1, n2, r, pos=None, posInd=None):
+    if posInd is None:
+        posInd = nearestIndex(d, pos)
+
     matrix = emptyMatrix(d)
-    currentPosition = source
-    while i < len(lenses) and lenses[i].pos < d[-1]:
-        matrix = np.matmul(space(d, currentPosition, lenses[i].pos), matrix)
-        matrix = np.matmul(lenses[i].matrix(d), matrix)
-        currentPosition = lenses[i].pos
-        i += 1
-    matrix = np.matmul(space(d, currentPosition, d[-1]), matrix)
+    matrix[posInd:,1,0] = (n1 - n2) / (r*n2)
+    matrix[posInd:,1,1] = n1 / n2
+
     return matrix
 
 def applyTransfer(q, matrix):
@@ -119,7 +117,7 @@ def plot(*beams, **kwargs):
     '''
     BUFFER = kwargs.get('BUFFER', 0.1)
     N = kwargs.get('N', 2000)
-    includeData = kwargs.get('includeData', False)
+    includeData = kwargs.get('includeData', True)
 
     # pre-process beams
     minSize = np.inf
@@ -128,7 +126,7 @@ def plot(*beams, **kwargs):
     beamSizes = [None]*len(beams)
     beamPhases = [None]*len(beams)
     plotData = [False]*len(beams)
-    for i in range(len(beams)):
+    for i, beam in enumerate(beams):
         beam = beams[i]
 
         if hasattr(beam, 'positionArray') and includeData:
@@ -164,28 +162,35 @@ def plot(*beams, **kwargs):
             maxSize = curMax
 
     waistUnit = determinePrefix(minSize)
+    showLegend = False
 
     # plot beams
-    plt.figure(figsize=(9, 6))
+    plt.figure(figsize=(7, 5))
     plt.subplot(211)
     for i in range(len(beams)):
         beam = beams[i]
-        plt.plot(beamDomains[i], beamSizes[i]/waistUnit[0], '-', color=beam.profile[3+i])
+        kwargs = {}
+        if beam.label is not None:
+            kwargs['label'] = beam.label
+            showLegend = True
+        plt.plot(beamDomains[i], beamSizes[i]/waistUnit[0], '-', color=beam.profile[3+i], **kwargs)
         if plotData[i]:
             plt.plot(beam.positionArray, beam.sizeArray/waistUnit[0], '.', markersize=10, color=beam.profile[2])
     plt.grid(which='both')
     plt.gca().autoscale(enable=True, axis='x', tight=True)
     plt.ylabel('Beam size [{}]'.format(waistUnit[1]))
     plt.ylim([0, (1+BUFFER)*maxSize/waistUnit[0]])
+    plt.legend(loc='best')
     plt.subplot(212)
     for i in range(len(beams)):
         plt.plot(beamDomains[i], beamPhases[i], '-', color=beam.profile[3+i])
-    plt.ylabel('Gouy phase [deg]')
+    plt.ylabel('Gouy phase [$^\circ$]')
     plt.xlabel('Position [m]')
     plt.grid(which='both')
     plt.gca().autoscale(enable=True, axis='x', tight=True)
     plt.ylim([-90, 90])
     plt.yticks(np.arange(-90, 90+30, 30))
+    plt.tight_layout()
     plt.show()
 
 def optimize(lenses, beam, target, position, tol=0.0001):
@@ -210,7 +215,7 @@ def optimize(lenses, beam, target, position, tol=0.0001):
         else:
             if isBeam:
                 target = target.propagateBeam(position, returnPhase=False)
-            return (beam.getRadius(q) - target)**2
+            return (beam.getRadius(q, position) - target)**2
 
     baseBound = (beam.source, position)
     if beam.reverse:
@@ -231,13 +236,29 @@ class Beam(object):
     A Beam object is defined by a complex beam parameter given at a particular position,
     as well as a list of lenses acting on the beam.
     '''
-    def __init__(self, source, sourceQ, wavelength, lenses=[], reverse=False):
+    def __init__(self, source, sourceQ, lenses=[], reverse=False, wavelength=None, label=None):
         '''
         Instantiate a beam with a given source position,
         complex beam parameter at source, wavelength, and
         list of Lens objects.
         '''
-        self.source, self.sourceQ, self.wavelength, self.lenses, self.reverse = source, sourceQ, wavelength, lenses, reverse
+        self.source, self.sourceQ, self.lenses, self.reverse, self.wavelength, self.label = source, sourceQ, lenses, reverse, wavelength, label
+
+    @property
+    def system(self):
+        '''
+        Getter for system context.
+        '''
+        if not hasattr(self, '__system'):
+            self.__system = DEFAULT_SYSTEM
+        return self.__system
+
+    @system.setter
+    def system(self, system):
+        '''
+        Setter for system context.
+        '''
+        self.__system = system
 
     @property
     def wavelength(self):
@@ -252,7 +273,7 @@ class Beam(object):
         Setter for wavelength; updates color information
         for plotting.
         '''
-        self.__wavelength = value
+        self.__wavelength = value if value is not None else self.system.wavelength
         for profile in BEAM_COLORS:
             if profile[0] < self.wavelength < profile[1]:
                 self.profile = profile
@@ -263,7 +284,6 @@ class Beam(object):
         '''
         Getter for lens list.
         '''
-        self.__lenses = sorted(self.__lenses, key=lambda x: x.pos)
         return self.__lenses
 
     @lenses.setter
@@ -271,7 +291,7 @@ class Beam(object):
         '''
         Setter for lens list; ensures list is sorted.
         '''
-        self.__lenses = value
+        self.__lenses = sorted(value, key=lambda x: x.pos)
 
     def setData(self, positionArray, sizeArray):
         '''
@@ -289,9 +309,34 @@ class Beam(object):
         Nx2x2 ray transfer matrix from the lenses
         associated with this beam.
         '''
-        return buildTransfer(d, self.source, self.lenses)
+        wv = self.wavelength
+        sub = self.system.ambientSubstrate
+        
+        d = np.array(d, ndmin=1)
+        for i in range(0, len(d)-1):
+            if d[i] > d[i+1]:
+                raise ValueError('List of positions should be sorted')
+                ################### TODO: add reverse logic
+        i = 0
+        matrix = emptyMatrix(d)
+        currentPosition = self.source
+        while i < len(self.lenses) and self.lenses[i].start() < d[-1]:
+            matrix = np.matmul(space(d, currentPosition, self.lenses[i].start()), matrix)
+            matrix = np.matmul(self.lenses[i].matrix(d, wv, sub), matrix)
+            currentPosition = self.lenses[i].end()
+            i += 1
+        matrix = np.matmul(space(d, currentPosition, d[-1]), matrix)
+        return matrix
 
-    def getRadius(self, q=None):
+    def path_wavelength(self, d):
+        d = np.array(d, ndmin=1)
+        n = np.ones(len(d)) * self.system.ambientSubstrate.n(self.wavelength)
+        for l in self.lenses:
+            if hasattr(l, 'substrate'):
+                n[(l.start()<d)&(d<l.end())] = l.substrate.n(self.wavelength)
+        return self.wavelength / n
+
+    def getRadius(self, q=None, d=None):
         '''
         Given a list of complex beam parameters,
         return the beam radii using the appropriate
@@ -299,7 +344,11 @@ class Beam(object):
         '''
         if q is None:
             q = self.sourceQ
-        return getRadius(q, self.wavelength)
+        if d is None:
+            wavelength = self.wavelength
+        else:
+            wavelength = self.path_wavelength(d)
+        return getRadius(q, wavelength)
 
     def propagateBeamQ(self, d):
         '''
@@ -316,7 +365,7 @@ class Beam(object):
         by propagating through the system of lenses.
         '''
         qValues = self.propagateBeamQ(d)
-        beamSizes = self.getRadius(qValues)
+        beamSizes = self.getRadius(qValues, d)
         if returnPhase:
             phases = getPhase(qValues)
             return beamSizes, phases
@@ -336,7 +385,7 @@ class Beam(object):
         self.lenses.remove(lens)
 
 
-def fitBeam(positionArray, sizeArray, source, wavelength, lenses=[]):
+def fitBeam(positionArray, sizeArray, source, wavelength, lenses=[], label=None):
     '''
     Given a list of positions, a list of beam radii, a source position,
     wavelength and a list of lenses (present during measurement),
@@ -352,14 +401,20 @@ def fitBeam(positionArray, sizeArray, source, wavelength, lenses=[]):
         raise ValueError('Source of beam cannot be in the middle of measurements')
 
     def beamSize(d, sourceQReal, sourceQImag):
-        newBeam = Beam(source, sourceQReal + sourceQImag * 1j, wavelength, lenses)
+        newBeam = Beam(source, sourceQReal + sourceQImag * 1j, lenses,
+                       (posMax < source), wavelength)
         return newBeam.propagateBeam(positionArray, returnPhase=False)
 
+    minBeamIndex = np.argmin(sizeArray)
+    initialGuess = (source - positionArray[minBeamIndex],
+                    np.pi*sizeArray[minBeamIndex]**2/wavelength)
+
     fitParams, _ = curve_fit(beamSize, positionArray, sizeArray,
-        bounds=([-np.inf, 0], [np.inf, np.inf]))
+                             bounds=([-np.inf, 0], [np.inf, np.inf]),
+                             p0=initialGuess)
 
     newBeam = Beam(source, fitParams[0] + fitParams[1] * 1j,
-        wavelength, lenses, reverse=(posMax < source))
+                   lenses, (posMax < source), wavelength, label)
     newBeam.setData(positionArray, sizeArray)
     return newBeam
 
@@ -369,15 +424,198 @@ class Lens(object):
     '''
     def __init__(self, f, pos=0, beams=None):
         self.f, self.pos = f, pos
+        self.addBeams(beams)
+
+    def addBeams(self, beams):
         if beams is not None:
             beams = np.array(beams, ndmin=1)
             for beam in beams:
                 beam.addLens(self)
 
-    def matrix(self, d):
-        posInd = np.argmax(d>=self.pos)
+    def matrix(self, d, wavelength, ambientSubstrate):
+        posInd = nearestIndex(d, self.pos)
 
         matrix = emptyMatrix(d)
         matrix[posInd:,1,0] = -1./self.f
 
         return matrix
+
+    def start(self):
+        return self.pos
+
+    def end(self):
+        return self.pos
+
+class ThickLens(Lens):
+    def __init__(self, r, pos=0, beams=None, substrate=None):
+        self.r, self.pos, self.substrate = r, pos, substrate
+        self.addBeams(beams)
+
+    def start(self):
+        return self.pos - self.thickness/2
+
+    def end(self):
+        return self.pos + self.thickness/2
+
+    def thicknessCalc(self):
+        thickness = 0.002
+
+        for r in [self.r1, self.r2]:
+            if r != np.inf:
+                thickness += r - np.sqrt(r**2 - (self.diameter/2)**2)
+
+        return thickness
+    
+    @property
+    def thickness(self):
+        if not hasattr(self, '__thickness'):
+            return self.thicknessCalc()
+        return self.__thickness
+
+    @thickness.setter
+    def thickness(self, value):
+        self.__thickness = value
+
+    @property
+    def diameter(self):
+        if not hasattr(self, '__diameter'):
+            self.__diameter = 0.0254
+        return self.__diameter
+
+    @diameter.setter
+    def diameter(self, value):
+        self.__diameter = value
+        
+    @property
+    def system(self):
+        if not hasattr(self, '__system'):
+            self.__system = DEFAULT_SYSTEM
+        return self.__system
+
+    @system.setter
+    def system(self, value):
+        self.__system = value
+        
+    @property
+    def substrate(self):
+        if not hasattr(self, '__substrate'):
+            self.__substrate = self.system.opticSubstrate
+        return self.__substrate
+
+    @substrate.setter
+    def substrate(self, value):
+        self.__substrate = value
+
+    def matrix(self, d, wavelength=None, ambientSubstrate=None):
+        if wavelength is None:
+            wavelength = self.system.wavelength
+        if ambientSubstrate is None:
+            ambientSubstrate = self.system.ambientSubstrate
+        
+        nLens = self.substrate.n(wavelength)
+        nAmbient = ambientSubstrate.n(wavelength)
+
+        start = self.start()
+        end = self.end()
+        
+        startInd = nearestIndex(d, start)
+        endInd = nearestIndex(d, end)
+
+        matrix = np.matmul(
+            np.matmul(curvedInterface(d, nLens, nAmbient, self.r2, posInd=endInd),
+                      space(d, startInd=startInd, endInd=endInd)),
+            curvedInterface(d, nAmbient, nLens, self.r1, posInd=startInd))
+        
+        return matrix
+        
+class PlanoConvex(ThickLens):
+    '''
+    A plano-convex(cave) lens, defined by a position,
+    a radius of curvature and a substrate material.
+    '''
+    @property
+    def r1(self):
+        if not hasattr(self, '__r1'):
+            self.__r1 = self.r
+        return self.__r1
+
+    @r1.setter
+    def r1(self, value):
+        self.__r1 = value
+        
+    @property
+    def r2(self):
+        if not hasattr(self, '__r1'):
+            self.__r2 = np.inf
+        return self.__r2
+
+    @r2.setter
+    def r2(self, value):
+        self.__r2 = value
+    
+class BiConvex(ThickLens):
+    '''
+    A bi-convex(cave) lens, defined by a position,
+    a radius (or radii) of curvature and a substrate
+    material.
+    '''        
+    @property
+    def r1(self):
+        if not hasattr(self, '__r1'):
+            self.__r1 = self.r
+        return self.__r1
+
+    @r1.setter
+    def r1(self, value):
+        self.__r1 = value
+        
+    @property
+    def r2(self):
+        if not hasattr(self, '__r1'):
+            self.__r2 = -self.r
+        return self.__r2
+
+    @r2.setter
+    def r2(self, value):
+        self.__r2 = value
+
+class Substrate(object):
+    '''
+    A substrate material, defined by a dispersion
+    formula.
+    '''
+    def __init__(self, n, microns=True):
+        '''
+        Initialize substrate with refractive index.
+        '''
+        self.n = lambda l: n(l*1e6 if microns else l)
+
+BK7 = Substrate(lambda l:
+                np.sqrt(1 +
+                        1.03961212*l**2/(l**2-0.00600069867) + 
+                        0.231792344*l**2/(l**2 - 0.0200179144) +
+                        1.01046945*l**2/(l**2 - 103.560653)
+                ))
+        
+FUSED_SILICA = Substrate(lambda l:
+                np.sqrt(1 +
+                        0.6961663*l**2/(l**2-0.0684043**2) + 
+                        0.4079426*l**2/(l**2 - 0.1162414**2) +
+                        0.8974794*l**2/(l**2 - 9.896161**2)
+                ))
+
+VACUUM = Substrate(lambda l: 1)
+AIR = Substrate(lambda l:
+                1 + 0.05792105/(238.0185 - l**-2) +
+                0.00167917/(57.362 - l**-2))
+
+class System(object):
+    def __init__(self, wavelength=1064e-9, opticSubstrate=BK7, ambientSubstrate=AIR):
+        self.wavelength, self.opticSubstrate, self.ambientSubstrate = wavelength, opticSubstrate, ambientSubstrate
+
+    def beam(self, *args, **kwargs):
+        newBeam = Beam(*args, **kwargs)
+        newBeam.system = self
+        return newBeam
+        
+DEFAULT_SYSTEM = System()
