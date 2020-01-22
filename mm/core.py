@@ -55,7 +55,7 @@ def empty_matrix(d):
     '''
     return np.tile(np.eye(2)[np.newaxis,:,:], (len(d), 1, 1) )
 
-def space(d, start=None, end=None, start_ind=None, end_ind=None):
+def space(d, n, start=None, end=None, start_ind=None, end_ind=None):
     '''
     Given a N-length list of distances and numbers specifying the
     start and end of propagation, return a Nx2x2 matrix for 
@@ -75,6 +75,8 @@ def space(d, start=None, end=None, start_ind=None, end_ind=None):
     matrix[start_ind:end_ind,0,1] = d[start_ind:end_ind]-start
     matrix[end_ind:,0,1] = end-start
 
+    matrix[:0,1] /= n
+    
     return matrix
 
 def curved_interface(d, n1, n2, r, pos=None, pos_ind=None):
@@ -99,8 +101,8 @@ def get_radius(q, wavelength):
     Given a list of complex beam parameters and a wavelength,
     calculate the beam radius from each q.
     '''
-    waistSize = np.sqrt(wavelength * np.imag(q) / np.pi)
-    return waistSize*np.sqrt(1 + (np.real(q) / np.imag(q))**2)
+    waist_size = np.sqrt(wavelength * np.imag(q) / np.pi)
+    return waist_size*np.sqrt(1 + (np.real(q) / np.imag(q))**2)
 
 def get_phase(q):
     '''
@@ -138,15 +140,20 @@ def plot(*beams, **kwargs):
             plot_data[i] = True
         else:
             if beam.reverse:
-                domains = [-2*np.real(beam.sourceQ),
-                            beam.source - np.imag(beam.sourceQ),
-                            default_ext([x.pos for x in beam.lenses], beam.source, min=True)]
+                last_lens = default_ext([x.pos for x in beam.lenses], beam.source, min=True)
+                last_q = beam.propagate_beam_q(last_lens-BUFFER).item()
+                domains = [last_lens-BUFFER-2*np.real(last_q),
+                            beam.source - np.imag(last_q),
+                            last_lens]
                 domain_start = apply_buffer(min(domains), BUFFER, left=True)
                 domain_end = beam.source
             else:
-                domains = [-2*np.real(beam.sourceQ),
-                            beam.source + np.imag(beam.sourceQ),
-                            default_ext([x.pos for x in beam.lenses], beam.source)]
+                last_lens = default_ext([x.pos for x in beam.lenses], beam.source)
+                last_q = beam.propagate_beam_q(last_lens+BUFFER).item()
+                domains = [last_lens+BUFFER-2*np.real(last_q),
+                            beam.source + np.imag(last_q),
+                            last_lens]
+
                 domain_start = beam.source
                 domain_end = apply_buffer(max(domains), BUFFER)
             beam_domains[i] = np.linspace(domain_start, domain_end, N)
@@ -176,11 +183,16 @@ def plot(*beams, **kwargs):
         plt.plot(beam_domains[i], beam_sizes[i]/waist_unit[0], '-', color=beam.profile[3+i], **kwargs)
         if plot_data[i]:
             plt.plot(beam.position_array, beam.size_array/waist_unit[0], '.', markersize=10, color=beam.profile[2])
+            
+        for j in range(len(beam.lenses)):
+            plt.axvline(x=beam.lenses[j].pos, linestyle='--', color=beam.profile[2], alpha=0.5)
+            
     plt.grid(which='both')
     plt.gca().autoscale(enable=True, axis='x', tight=True)
     plt.ylabel('Beam size [{}]'.format(waist_unit[1]))
     plt.ylim([0, (1+BUFFER)*max_size/waist_unit[0]])
-    plt.legend(loc='best')
+    if show_legend:
+        plt.legend(loc='best')
     plt.subplot(212)
     for i in range(len(beams)):
         plt.plot(beam_domains[i], beam_phases[i], '-', color=beam.profile[3+i])
@@ -207,7 +219,7 @@ def optimize(lenses, beam, target, position, tol=0.0001):
 
         q = beam.propagate_beam_q(position)
 
-        is_beam = not isinstance(target, (int, long, float, complex))
+        is_beam = not isinstance(target, (int, float, complex))
 
         if is_beam and len(lenses) > 1:
             target = target.propagate_beam_q(position)
@@ -227,7 +239,13 @@ def optimize(lenses, beam, target, position, tol=0.0001):
     for i in range(len(lenses)):
         lenses[i].pos = positions[i]
 
-    return positions
+    is_beam = not isinstance(target, (int, float, complex))
+    q = beam.propagate_beam_q(position)
+    if is_beam:
+        q2 = target.propagate_beam_q(position)
+        return ((q * np.conj(q2) / (np.conj(q2) - q)) * (2*beam.wavelength / (get_radius(q2, beam.wavelength) / get_radius(q, beam.wavelength) / np.pi)) * -1j)**4
+    else:
+        return np.abs(q-target)
 
 ### CLASSES
 
@@ -311,6 +329,7 @@ class Beam(object):
         '''
         wv = self.wavelength
         sub = self.system.ambient_substrate
+        n0 = sub.n(wv)
         
         d = np.array(d, ndmin=1)
         for i in range(0, len(d)-1):
@@ -321,11 +340,11 @@ class Beam(object):
         matrix = empty_matrix(d)
         current_position = self.source
         while i < len(self.lenses) and self.lenses[i].start() < d[-1]:
-            matrix = np.matmul(space(d, current_position, self.lenses[i].start()), matrix)
+            matrix = np.matmul(space(d, n0, current_position, self.lenses[i].start()), matrix)
             matrix = np.matmul(self.lenses[i].matrix(d, wv, sub), matrix)
             current_position = self.lenses[i].end()
             i += 1
-        matrix = np.matmul(space(d, current_position, d[-1]), matrix)
+        matrix = np.matmul(space(d, n0, current_position, d[-1]), matrix)
         return matrix
 
     def path_wavelength(self, d):
@@ -333,7 +352,9 @@ class Beam(object):
         n = np.ones(len(d)) * self.system.ambient_substrate.n(self.wavelength)
         for l in self.lenses:
             if hasattr(l, 'substrate'):
-                n[(l.start()<d)&(d<l.end())] = l.substrate.n(self.wavelength)
+                start = nearest_index(d, l.start())
+                end = nearest_index(d, l.end())
+                n[start:end] = l.substrate.n(self.wavelength)
         return self.wavelength / n
 
     def get_radius(self, q=None, d=None):
@@ -400,18 +421,41 @@ def fit_beam(position_array, size_array, source, wavelength, lenses=[], label=No
     if position_array.min() < source < pos_max:
         raise ValueError('Source of beam cannot be in the middle of measurements')
 
+    def kinked_line(d, a1, b1, a2, b2):
+        if a1 != a2:
+            d0 = (b2 - b1)/(a1 - a2)
+        else:
+            d0 = 0
+            
+        size = np.zeros(d.shape)
+        size[d<=d0] = a1*(d[d<=d0]-b1)
+        size[d>d0] = a2*(d[d>d0]-b2)
+        return size
+
+    prefit_params, _ = curve_fit(kinked_line, position_array, size_array)
+    a1, b1, a2, b2 = prefit_params
+
+    if np.sign(a1) == np.sign(a2):
+        def line(d, a, b):
+            return a*(d-b)
+        prefit_params, _ = curve_fit(line, position_array, size_array)
+        a, b = prefit_params
+        waist_pos = b
+        waist = wavelength / np.pi / a
+    else:
+        waist_pos = (b2 - b1)/(a1 - a2)
+        waist = np.min(size_array)
+    
     def beam_size(d, source_q_real, source_q_imag):
         new_beam = Beam(source, source_q_real + source_q_imag * 1j, lenses,
                        (pos_max < source), wavelength)
         return new_beam.propagate_beam(position_array, return_phase=False)
 
-    min_beam_index = np.argmin(size_array)
-    initial_guess = (source - position_array[min_beam_index],
-                    np.pi*size_array[min_beam_index]**2/wavelength)
+    initial_guess = (source - waist_pos, waist)
 
     fit_params, _ = curve_fit(beam_size, position_array, size_array,
-                             bounds=([-np.inf, 0], [np.inf, np.inf]),
-                             p0=initial_guess)
+                              bounds=([-np.inf, 0], [np.inf, np.inf]),
+                              p0=initial_guess)
 
     new_beam = Beam(source, fit_params[0] + fit_params[1] * 1j,
                    lenses, (pos_max < source), wavelength, label)
@@ -458,18 +502,21 @@ class ThickLens(Lens):
         return self.pos + self.thickness/2
 
     def thickness_calc(self):
-        thickness = 0.002
+        if self.r1 > 0 and self.r2 > 0:
+            thickness = 0.00635
 
-        for r in [self.r1, self.r2]:
-            if r != np.inf:
-                thickness += r - np.sqrt(r**2 - (self.diameter/2)**2)
+            for r in [self.r1, self.r2]:
+                if r != np.inf:
+                    thickness += r - np.sqrt(r**2 - (self.diameter/2)**2)
+        else:
+            thickness = 0.0035
 
         return thickness
     
     @property
     def thickness(self):
         if not hasattr(self, '__thickness'):
-            return self.thickness_calc()
+            self.__thickness = self.thickness_calc()
         return self.__thickness
 
     @thickness.setter
@@ -523,7 +570,7 @@ class ThickLens(Lens):
 
         matrix = np.matmul(
             np.matmul(curved_interface(d, n_lens, nAmbient, self.r2, pos_ind=end_ind),
-                      space(d, start_ind=start_ind, end_ind=end_ind)),
+                      space(d, n_lens, start_ind=start_ind, end_ind=end_ind)),
             curved_interface(d, nAmbient, n_lens, self.r1, pos_ind=start_ind))
         
         return matrix
@@ -592,14 +639,14 @@ class Substrate(object):
 
 BK7 = Substrate(lambda l:
                 np.sqrt(1 +
-                        1.03961212*l**2/(l**2-0.00600069867) + 
+                        1.03961212*l**2/(l**2 - 0.00600069867) + 
                         0.231792344*l**2/(l**2 - 0.0200179144) +
                         1.01046945*l**2/(l**2 - 103.560653)
                 ))
         
 FUSED_SILICA = Substrate(lambda l:
                 np.sqrt(1 +
-                        0.6961663*l**2/(l**2-0.0684043**2) + 
+                        0.6961663*l**2/(l**2 - 0.0684043**2) + 
                         0.4079426*l**2/(l**2 - 0.1162414**2) +
                         0.8974794*l**2/(l**2 - 9.896161**2)
                 ))
@@ -610,7 +657,7 @@ AIR = Substrate(lambda l:
                 0.00167917/(57.362 - l**-2))
 
 class System(object):
-    def __init__(self, wavelength=1064e-9, optic_substrate=BK7, ambient_substrate=AIR):
+    def __init__(self, wavelength=1064e-9, optic_substrate=FUSED_SILICA, ambient_substrate=AIR):
         self.wavelength, self.optic_substrate, self.ambient_substrate = wavelength, optic_substrate, ambient_substrate
 
     def beam(self, *args, **kwargs):
